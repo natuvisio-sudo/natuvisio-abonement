@@ -1,103 +1,103 @@
-# streamlit_subscriptions.py
-# NATUVISIO - Abonelik Paneli (Iyzico Sandbox hazır)
-# Türkçe arayüz - Streamlit UI
-# Flask optional (webhook) - if Flask is not installed, webhook is disabled gracefully.
+# streamlit_subscriptions_form.py
+# NATUVISIO - Abonelik Formu (tek sayfa, Türkçe)
+# - E-posta, İsim, Telefon, Adres
+# - 2 ürün: BLACK STUFF WELLBEING, BLACK STUFF OXIFIT
+# - Abonelik frekansı, kupon, not
+# - Iyzico checkout oluşturma (sandbox) - opsiyonel
+# - Kayıt: sqlite (natuvisio_subscriptions.sqlite)
+# - Derin abonelik/iş akışı açıklamaları alt kısımda
 
 import os
 import json
 import uuid
-import time
 import sqlite3
-import threading
+import time
 from datetime import datetime
-import urllib.parse
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Optional imports
-try:
-    from flask import Flask, request, jsonify
-    FLASK_AVAILABLE = True
-except Exception:
-    FLASK_AVAILABLE = False
-
+# Optional: requests for Iyzico API calls
 try:
     import requests
 except Exception:
     requests = None
 
-# -----------------------
-# CONFIG / ORTAM DEGISKENLERI (ENV vars recommended)
-# -----------------------
-st.set_page_config(page_title="NATUVISIO - Abonelik", layout="wide")
+st.set_page_config(page_title="NATUVISIO - Abonelik Formu", layout="wide")
 
+# -----------------------
+# AYARLAR / ORTAM DEGISKENLERI
+# -----------------------
 LOGO_URL = os.getenv("LOGO_URL", "https://res.cloudinary.com/deb1j92hy/image/upload/f_auto,q_auto/v1764805291/natuvisio_logo_gtqtfs.png")
 BG_IMAGE = os.getenv("BG_IMAGE", "https://res.cloudinary.com/deb1j92hy/image/upload/v1764848571/man-standing-brown-mountain-range_elqddb.webp")
 
-# Iyzico (varsayılan sandbox endpoints; production değiştirin)
 IYZICO_API_KEY = os.getenv("IYZICO_API_KEY", "")
 IYZICO_SECRET_KEY = os.getenv("IYZICO_SECRET_KEY", "")
 IYZICO_BASE_API = os.getenv("IYZICO_BASE_API", "https://sandbox-api.iyzipay.com")
 IYZICO_CHECKOUT_BASE = os.getenv("IYZICO_CHECKOUT_URL", "https://sandbox-checkout.iyzipay.com/checkoutform/initialize")
+CALLBACK_BASE_URL = os.getenv("CALLBACK_BASE_URL", "")  # ngrok veya public endpoint
 
-# Plan ref kodları (iyzico dashboard / partner panelden alınacak)
-WELLBEING_PLAN_REF = os.getenv("WELLBEING_PLAN_REF", "")
-OXIFIT_PLAN_REF = os.getenv("OXIFIT_PLAN_REF", "")
+DB_FILE = os.getenv("SUBSCRIPTIONS_DB", "natuvisio_subscriptions.sqlite")
 
-# Webhook callback base url (ngrok / public endpoint) örn: https://abcd-1234.ngrok.io
-CALLBACK_BASE_URL = os.getenv("CALLBACK_BASE_URL", "")
+# ÜRÜN HARITASI (SKU ve temel fiyat gösterimi - fiyat örnektir)
+PRODUCTS = {
+    "BLACK STUFF WELLBEING": {"sku": "BS-WELL-01", "price": 299, "desc": "Günlük gut mikrobiom destek formülü (30 kapsül)."},
+    "BLACK STUFF OXIFIT": {"sku": "BS-OXIFIT-01", "price": 349, "desc": "Performans & oksijen taşıma destek formülü (30 kapsül)."}
+}
 
-DATA_DB = os.getenv("SUBSCRIPTIONS_DB", "natuvisio_subscriptions.sqlite")
-
-ADMIN_PASS = os.getenv("ADMIN_PASS", "admin2025")
+# PLAN REFERANSLARI (Iyzico panelden alınacaksa buraya koyun)
+WELL_PLAN_REF = os.getenv("WELL_PLAN_REF", "")
+OXI_PLAN_REF = os.getenv("OXI_PLAN_REF", "")
 
 # -----------------------
-# STYLES
+# STIL
 # -----------------------
 def load_css():
     st.markdown(f"""
     <style>
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
       .stApp {{
-        background-image: linear-gradient(rgba(255,255,255,0.08), rgba(255,255,255,0.08)), url("{BG_IMAGE}");
+        background-image: linear-gradient(rgba(255,255,255,0.06), rgba(255,255,255,0.06)), url("{BG_IMAGE}");
         background-size: cover;
         background-position: center;
         font-family: Inter, sans-serif;
       }}
-      .glass-card {{
-        background: rgba(255,255,255,0.66);
+      .card {{
+        background: rgba(255,255,255,0.78);
+        padding: 20px;
         border-radius: 12px;
-        padding: 18px;
-        box-shadow: 0 8px 30px rgba(0,0,0,0.08);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.07);
       }}
       .muted {{ color: #6b7280; font-size:13px; }}
-      .big-title {{ font-size:20px; font-weight:700; color:#164e33; }}
-      iframe {{ border: none; border-radius: 8px; }}
+      h1 {{ color: #234e35; }}
+      iframe {{ border: none; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,0.15); }}
       #MainMenu, header, footer {{ visibility: hidden; }}
     </style>
     """, unsafe_allow_html=True)
 
 # -----------------------
-# DB (sqlite) - basit, ACID-safe
+# DB
 # -----------------------
 def init_db():
-    conn = sqlite3.connect(DATA_DB, check_same_thread=False)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cur = conn.cursor()
     cur.execute("""
     CREATE TABLE IF NOT EXISTS subscriptions (
         id TEXT PRIMARY KEY,
-        sku TEXT,
-        plan_reference TEXT,
-        iyzico_checkout_token TEXT,
-        iyzico_subscription_reference TEXT,
-        status TEXT,
-        customer_name TEXT,
-        customer_email TEXT,
-        customer_phone TEXT,
         created_at TEXT,
-        updated_at TEXT,
-        raw_payload TEXT
+        email TEXT,
+        name TEXT,
+        phone TEXT,
+        address TEXT,
+        sku TEXT,
+        sku_price REAL,
+        frequency TEXT,
+        coupon TEXT,
+        note TEXT,
+        iyzico_token TEXT,
+        iyzico_ref TEXT,
+        status TEXT,
+        raw_response TEXT
     )
     """)
     conn.commit()
@@ -105,280 +105,274 @@ def init_db():
 
 conn = init_db()
 
-def save_subscription_record(record: dict):
+def save_record(rec):
     cur = conn.cursor()
     cur.execute("""
-      INSERT INTO subscriptions (id, sku, plan_reference, iyzico_checkout_token, iyzico_subscription_reference, status, customer_name, customer_email, customer_phone, created_at, updated_at, raw_payload)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO subscriptions (id, created_at, email, name, phone, address, sku, sku_price, frequency, coupon, note, iyzico_token, iyzico_ref, status, raw_response)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        record.get("id"),
-        record.get("sku"),
-        record.get("plan_reference"),
-        record.get("iyzico_checkout_token"),
-        record.get("iyzico_subscription_reference"),
-        record.get("status"),
-        record.get("customer_name"),
-        record.get("customer_email"),
-        record.get("customer_phone"),
-        record.get("created_at"),
-        record.get("updated_at"),
-        json.dumps(record.get("raw_payload", {}), ensure_ascii=False)
+        rec.get("id"),
+        rec.get("created_at"),
+        rec.get("email"),
+        rec.get("name"),
+        rec.get("phone"),
+        rec.get("address"),
+        rec.get("sku"),
+        rec.get("sku_price"),
+        rec.get("frequency"),
+        rec.get("coupon"),
+        rec.get("note"),
+        rec.get("iyzico_token"),
+        rec.get("iyzico_ref"),
+        rec.get("status"),
+        json.dumps(rec.get("raw_response", {}), ensure_ascii=False)
     ))
     conn.commit()
 
-def update_subscription_by_iyzico_ref(iyz_ref, status, payload):
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    cur.execute("UPDATE subscriptions SET status=?, updated_at=?, raw_payload=? WHERE iyzico_subscription_reference=?", (status, now, json.dumps(payload, ensure_ascii=False), iyz_ref))
-    if cur.rowcount == 0:
-        # not found -> insert minimal record
-        cur.execute("""INSERT INTO subscriptions (id, sku, plan_reference, iyzico_checkout_token, iyzico_subscription_reference, status, created_at, updated_at, raw_payload)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", (str(uuid.uuid4()), "", "", "", iyz_ref, status, now, now, json.dumps(payload, ensure_ascii=False)))
-    conn.commit()
-
-def fetch_subscriptions(limit=200):
-    cur = conn.cursor()
-    cur.execute("SELECT id, sku, plan_reference, iyzico_subscription_reference, status, customer_name, customer_email, customer_phone, created_at FROM subscriptions ORDER BY created_at DESC LIMIT ?", (limit,))
-    return cur.fetchall()
-
 # -----------------------
-# IYZICO helper
+# Iyzico helper (simple)
 # -----------------------
 def ensure_requests():
     if requests is None:
-        raise RuntimeError("requests kütüphanesi bulunamadı. 'pip install requests' çalıştırın.")
+        raise RuntimeError("requests kütüphanesi yüklü değil. 'pip install requests' çalıştırın.")
 
-def create_subscription_checkout(plan_reference, customer_email, customer_name, gsm_number, conversation_id=None):
+def create_iyzico_checkout(plan_ref, customer):
     """
-    Iyzico sandbox: POST /v2/subscription/checkout-form/initialize
-    Returns checkout_url, raw_response
+    Basit sandbox çağrısı - gerçek üretime göre uyarlanmalı.
+    Döndürülen token/checkout formu embed edilecek şekilde işlenecek.
     """
     ensure_requests()
     if not IYZICO_API_KEY or not IYZICO_SECRET_KEY:
-        raise RuntimeError("IYZICO_API_KEY veya IYZICO_SECRET_KEY tanımlı değil. Ortam değişkenlerini ayarlayın.")
+        raise RuntimeError("Iyzico anahtarları (env) bulunamadı.")
     url = f"{IYZICO_BASE_API}/v2/subscription/checkout-form/initialize"
     payload = {
         "locale": "tr",
-        "conversationId": conversation_id or str(uuid.uuid4()),
-        "pricingPlanReferenceCode": plan_reference,
+        "conversationId": str(uuid.uuid4()),
+        "pricingPlanReferenceCode": plan_ref,
         "callbackUrl": f"{CALLBACK_BASE_URL}/iyzico_callback" if CALLBACK_BASE_URL else "",
         "customer": {
-            "email": customer_email,
-            "name": (customer_name.split(" ")[0] if customer_name else ""),
-            "surname": (" ".join(customer_name.split(" ")[1:]) if customer_name and len(customer_name.split(" "))>1 else ""),
-            "gsmNumber": gsm_number
+            "email": customer["email"],
+            "name": customer["name"].split(" ")[0] if customer["name"] else "",
+            "surname": " ".join(customer["name"].split(" ")[1:]) if customer["name"] and len(customer["name"].split(" "))>1 else "",
+            "gsmNumber": customer["phone"]
         }
     }
     headers = {"Content-Type": "application/json"}
-    # Basic auth with API key / secret may work; some iyzico clients expect special headers. This is sandbox approach.
     resp = requests.post(url, headers=headers, auth=(IYZICO_API_KEY, IYZICO_SECRET_KEY), json=payload, timeout=20)
-    if resp.status_code != 200 and resp.status_code != 201:
-        raise RuntimeError(f"Iyzico hata ({resp.status_code}): {resp.text}")
-    data = resp.json()
-    token = data.get("token") or data.get("checkoutFormContent")
-    # token may be direct checkout content; if it's token, compose checkout url
-    checkout_url = None
-    if isinstance(token, str) and token.startswith("https://"):
-        checkout_url = token
-    elif token and len(token) < 400:
-        checkout_url = f"{IYZICO_CHECKOUT_BASE}/{token}"
-    else:
-        # sometimes API returns HTML form; we can embed it
-        checkout_url = None
-    return checkout_url, data
+    return resp
 
 # -----------------------
-# Flask webhook (optional)
+# UI: form
 # -----------------------
-if FLASK_AVAILABLE:
-    flask_app = Flask(__name__)
+load_css()
+st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
 
-    @flask_app.route("/iyzico_callback", methods=["POST"])
-    def iyzico_callback():
-        payload = request.get_json(force=True)
-        # Try multiple possible keys for subscription reference
-        iyz_ref = payload.get("subscriptionReferenceCode") or payload.get("subscriptionReference") or payload.get("subscriptionReferenceId") or payload.get("subscriptionCode")
-        status = payload.get("status") or payload.get("paymentStatus") or "unknown"
-        if iyz_ref:
-            update_subscription_by_iyzico_ref(iyz_ref, status, payload)
+colL, colR = st.columns([2,1])
+
+with colL:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.image(LOGO_URL, width=120)
+    st.header("NATUVISIO - Abonelik Formu")
+    st.write("Lütfen formu doldurun. Abonelik, seçilen ürüne göre her periyotta otomatik ödemedir ve paketler kapınıza gönderilir.")
+    st.markdown("### Müşteri Bilgileri")
+    email = st.text_input("E-posta", placeholder="ornek@eposta.com")
+    name = st.text_input("Ad - Soyad", placeholder="Adınız Soyadınız")
+    phone = st.text_input("Telefon (örn. +90555...)", placeholder="+905...")
+    address = st.text_area("Adres (Teslimat adresi)", placeholder="Cadde, Mahalle, Şehir, Posta Kodu", height=80)
+
+    st.markdown("### Ürün Seçimi")
+    sku = st.selectbox("Ürün", list(PRODUCTS.keys()))
+    sku_meta = PRODUCTS[sku]
+    st.markdown(f"**{sku}** — {sku_meta['desc']}  \nFiyat (örnek): **{sku_meta['price']}₺**")
+
+    st.markdown("### Abonelik Seçenekleri")
+    freq = st.selectbox("Frekans", ["30 gün (aylık)", "60 gün", "90 gün"])
+    trial = st.selectbox("İlk ödeme / deneme", ["İlk ödeme tam", "İlk ödeme indirimli (%20)", "7 günlük ücretsiz deneme (sonra ücretlendirme)"])
+    coupon = st.text_input("Kupon Kodu (opsiyonel)")
+    note = st.text_area("Not / Sipariş açıklaması (opsiyonel)", height=60)
+
+    st.markdown("### Onay & Gizlilik")
+    agree = st.checkbox("Abonelik Şartlarını, İptal Politikası ve Otomatik Ödeme Talimatını okudum ve kabul ediyorum.", value=False)
+
+    if st.button("Aboneliği Oluştur ve Ödeme Sayfasına Git"):
+        if not (email and name and phone and address):
+            st.error("Lütfen e-posta, isim, telefon ve adres bilgilerini doldurun.")
+        elif not agree:
+            st.error("Abonelik için gizlilik/şartlar onayı gereklidir.")
         else:
-            # store raw payload
-            update_subscription_by_iyzico_ref(str(uuid.uuid4()), "callback_received", payload)
-        return jsonify({"ok": True}), 200
+            # kaydı oluştur
+            rec_id = "NV-SUB-" + datetime.utcnow().strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:6]
+            rec = {
+                "id": rec_id,
+                "created_at": datetime.utcnow().isoformat(),
+                "email": email,
+                "name": name,
+                "phone": phone,
+                "address": address,
+                "sku": sku,
+                "sku_price": sku_meta["price"],
+                "frequency": freq,
+                "coupon": coupon,
+                "note": note,
+                "iyzico_token": "",
+                "iyzico_ref": "",
+                "status": "created",
+                "raw_response": {}
+            }
+            save_record(rec)
+            st.success(f"Abonelik kaydı oluşturuldu — ID: {rec_id}")
 
-    def run_flask():
-        flask_app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
-
-    def ensure_flask_started():
-        if not hasattr(ensure_flask_started, "started"):
-            t = threading.Thread(target=run_flask, daemon=True)
-            t.start()
-            ensure_flask_started.started = True
-            time.sleep(0.4)
-else:
-    def ensure_flask_started():
-        return
-
-# -----------------------
-# UI: login + subscription flow
-# -----------------------
-def login_screen():
-    load_css()
-    st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        st.image(LOGO_URL, width=120)
-        st.markdown("<div class='big-title'>NATUVISIO - Abonelik Yönetimi</div>", unsafe_allow_html=True)
-        st.markdown("<div class='muted'>Admin veya Partner hesabınız ile giriş yapın.</div>", unsafe_allow_html=True)
-        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-        mode = st.radio("Giriş Tipi", ["Admin", "Partner"], horizontal=True)
-        if mode == "Admin":
-            pwd = st.text_input("Admin Şifre", type="password", key="admin_pwd")
-            if st.button("Giriş Yap (Admin)"):
-                if pwd == ADMIN_PASS:
-                    st.session_state.admin_logged_in = True
-                    st.success("Admin olarak giriş yapıldı.")
-                    st.experimental_rerun()
-                else:
-                    st.error("Hatalı şifre")
-        else:
-            # basit partner auth (demo): email & password karşılaştırması için local sqlite 'partners' table isteğe bağlı
-            st.info("Partner girişi: demo modu. Email yazıp 'Partner Giriş'e basın.")
-            email = st.text_input("E-posta (partner demo)", key="partner_email")
-            if st.button("Partner Giriş"):
-                if email:
-                    st.session_state.is_partner_logged_in = True
-                    st.session_state.partner_brand = "HAKI HEAL"  # demo default
-                    st.success("Partner oturumu açıldı (demo).")
-                    st.experimental_rerun()
-
-# -----------------------
-# ADMIN DASHBOARD (basit)
-# -----------------------
-def admin_dashboard():
-    load_css()
-    ensure_flask_started()
-    st.markdown("<div class='big-title'>Admin - Abonelik Yönetimi</div>", unsafe_allow_html=True)
-    st.markdown("<div class='muted'>Iyzico Sandbox ile abonelik oturumları oluşturun ve kayıtları görüntüleyin.</div>", unsafe_allow_html=True)
-    st.markdown("---")
-
-    st.markdown("### Sanity Check / Ayarlar")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.write("Iyzico API Key set:")
-        st.code(IYZICO_API_KEY or "— boş —", language="text")
-    with col2:
-        st.write("Iyzico Secret Key set:")
-        st.code(IYZICO_SECRET_KEY or "— boş —", language="text")
-    with col3:
-        st.write("Callback base URL:")
-        st.code(CALLBACK_BASE_URL or "— boş —", language="text")
-
-    st.markdown("---")
-    st.markdown("### Abonelik Oluştur (Sandbox)")
-    sku_choice = st.selectbox("Ürün SKU", ["BLACK STUFF WELLBEING", "BLACK STUFF OXIFIT"])
-    plan_map = {"BLACK STUFF WELLBEING": WELLBEING_PLAN_REF, "BLACK STUFF OXIFIT": OXIFIT_PLAN_REF}
-    plan_ref = plan_map.get(sku_choice)
-
-    st.markdown("#### Müşteri Bilgileri")
-    c1, c2 = st.columns(2)
-    with c1:
-        cust_name = st.text_input("Ad Soyad", value="Musteri Ornek")
-    with c2:
-        cust_email = st.text_input("E-posta", value="muster@ornek.com")
-    cust_phone = st.text_input("Telefon (örn. +90555...)", value="+905555555555")
-
-    if st.button("Abonelik Ödeme Sayfası Oluştur ve iframe göster"):
-        try:
-            if not plan_ref:
-                st.error("Bu SKU için plan referansı ayarlı değil. WELLBEING_PLAN_REF veya OXIFIT_PLAN_REF ortam değişkenlerini ayarlayın.")
+            # Iyzico checkout (opsiyonel): plan referansı varsa çağır
+            plan_ref = WELL_PLAN_REF if sku == "BLACK STUFF WELLBEING" else OXI_PLAN_REF
+            if plan_ref and requests is not None:
+                try:
+                    st.info("Iyzico checkout oluşturuluyor (sandbox)...")
+                    resp = create_iyzico_checkout(plan_ref, {"email": email, "name": name, "phone": phone})
+                    if resp.status_code in (200,201):
+                        data = resp.json()
+                        token = data.get("token") or data.get("checkoutFormContent") or ""
+                        # bazı durumlarda token HTML form içerir
+                        # iframe için token varsa checkout url oluştur
+                        checkout_url = None
+                        if isinstance(token, str) and token.startswith("https://"):
+                            checkout_url = token
+                        elif token and len(token)<400:
+                            checkout_url = f"{IYZICO_CHECKOUT_BASE}/{token}"
+                        # güncelle DB
+                        cur = conn.cursor()
+                        cur.execute("UPDATE subscriptions SET iyzico_token=?, iyzico_ref=?, status=?, raw_response=? WHERE id=?",
+                                    (token, data.get("subscriptionReference") or data.get("subscriptionReferenceCode") or "", "checkout_ready", json.dumps(data, ensure_ascii=False), rec_id))
+                        conn.commit()
+                        if checkout_url:
+                            st.success("Ödeme sayfası hazır. Aşağıdaki iframe üzerinden ödeme tamamlanabilir.")
+                            components.html(f'<iframe src="{checkout_url}" width="100%" height="700"></iframe>', height=700)
+                        else:
+                            st.warning("Iyzico'dan beklenen iframe URL'si gelmedi. Raw response gösteriliyor.")
+                            st.code(json.dumps(data, ensure_ascii=False, indent=2))
+                    else:
+                        st.error(f"Iyzico hata: {resp.status_code} — {resp.text[:200]}")
+                        # DB'yi hata ile güncelle
+                        cur = conn.cursor()
+                        cur.execute("UPDATE subscriptions SET status=?, raw_response=? WHERE id=?", ("iyzico_error", json.dumps({"status": resp.status_code, "text": resp.text}, ensure_ascii=False), rec_id))
+                        conn.commit()
+                except Exception as e:
+                    st.exception(e)
+                    cur = conn.cursor()
+                    cur.execute("UPDATE subscriptions SET status=?, raw_response=? WHERE id=?", ("iyzico_exception", json.dumps({"error": str(e)}, ensure_ascii=False), rec_id))
+                    conn.commit()
             else:
-                checkout_url, raw = create_subscription_checkout(plan_ref, cust_email, cust_name, cust_phone)
-                rec_id = str(uuid.uuid4())
-                rec = {
-                    "id": rec_id,
-                    "sku": sku_choice,
-                    "plan_reference": plan_ref,
-                    "iyzico_checkout_token": raw.get("token", "") or "",
-                    "iyzico_subscription_reference": raw.get("subscriptionReference") or raw.get("subscriptionReferenceCode") or "",
-                    "status": "pending",
-                    "customer_name": cust_name,
-                    "customer_email": cust_email,
-                    "customer_phone": cust_phone,
-                    "created_at": datetime.utcnow().isoformat(),
-                    "updated_at": datetime.utcnow().isoformat(),
-                    "raw_payload": raw
-                }
-                save_subscription_record(rec)
-                st.success("Abonelik kaydı oluşturuldu. Checkout iframe aşağıda gösteriliyor (sandbox).")
-                if checkout_url:
-                    components.html(f'<iframe src="{checkout_url}" width="100%" height="720"></iframe>', height=720)
+                # Iyzico plan yoksa veya requests yoksa sadece kayıt oluşturuldu uyarısı
+                if not plan_ref:
+                    st.info("Bu SKU için Iyzico plan referansı tanımlı değil. (WELL_PLAN_REF / OXI_PLAN_REF). Sadece kayıt oluşturuldu.")
                 else:
-                    # fallback: show raw payload content (maybe contains checkout form HTML)
-                    st.code(json.dumps(raw, ensure_ascii=False, indent=2))
-        except Exception as e:
-            st.exception(e)
+                    st.info("Requests kütüphanesi veya Iyzico anahtarları eksik. Sadece kayıt oluşturuldu.")
 
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with colR:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("## Özet & Hızlı Bilgiler")
+    st.markdown(f"**Seçili Ürün:** {st.session_state.get('sku_selected', '—')}")
+    st.markdown("**Abonelik Avantajları:**")
+    st.write("- Otomatik teslimat her seçilen periyotta (ör: 30 gün).")
+    st.write("- İlk ödeme seçenekleri: tam, indirimli veya deneme.")
+    st.write("- İptal: Müşteri istediği anda iptal edebilir; bir sonraki çekim iptal edilir.")
     st.markdown("---")
-    st.markdown("### Kayıtlı Abonelikler (Son 200)")
-    rows = fetch_subscriptions(200)
-    if rows:
-        for r in rows:
-            st.markdown(f"**ID:** {r[0]}  —  **SKU:** {r[1]}  —  **IyzRef:** {r[3] or '<boş>'}  —  **Durum:** {r[4]}  —  **Müşteri:** {r[5]} / {r[6]}")
-    else:
-        st.info("Henüz abonelik kaydı yok.")
-
-    st.markdown("---")
-    if st.button("Çıkış"):
-        st.session_state.admin_logged_in = False
-        st.experimental_rerun()
+    st.markdown("## İpuçları (Operasyon)")
+    st.write("- Gönderimler: Abonelikte kargo etiketi abonelik id ile eşlenmeli.")
+    st.write("- İade/iptal: İlk 14 gün içinde koşullara göre iade/iptal politikası uygulanır (ürüne göre farklılık gösterebilir).")
+    st.write("- Faturalama: Aylık fatura otomatik üretilmeli; marka komisyonu reconciliation için CSV.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # -----------------------
-# PARTNER DASHBOARD (demo, hafif)
+# ABONELIK DETAYLARI (derinlemesine)
 # -----------------------
-def partner_dashboard():
-    load_css()
-    st.markdown("<div class='big-title'>Partner - Abonelik Özet (Demo)</div>", unsafe_allow_html=True)
-    st.markdown("<div class='muted'>Partnerler için temel görünüm: abonelik durumu ve müşteri listesi.</div>", unsafe_allow_html=True)
-    st.markdown("---")
-    rows = fetch_subscriptions(200)
-    st.markdown("### Abonelikleriniz (demo filtre yok)")
-    if rows:
-        for r in rows:
-            st.markdown(f"• {r[0]} | {r[1]} | {r[4]} | {r[5]} — {r[6]}")
-    else:
-        st.info("Kayıtlı abonelik yok.")
-    if st.button("Çıkış (Partner)"):
-        st.session_state.is_partner_logged_in = False
-        st.session_state.partner_brand = None
-        st.experimental_rerun()
+st.markdown("<div style='height:30px'></div>", unsafe_allow_html=True)
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.header("Abonelik Süreci — Detaylı Teknik ve Operasyonel Açıklama")
+st.markdown("""
+Aşağıda abonelik akışını, ödeme olaylarını, yönetim ve operasyon gereksinimlerini, iptal/dunning/faturalama mantığını ve marka-işletme (NATUVISIO <> marka partner) arasındaki finansal mutabakatı ayrıntılı olarak açıkladım.
+
+---
+
+### 1) Abonelik Oluşumu (Müşteri tarafı)
+1. Müşteri formu doldurur: e-posta, isim, telefon, adres, ürün seçimi, frekans ve onay.
+2. Sunucu tarafı bir kayıt (subscription record) oluşturur — `status: created`.
+3. Eğer Iyzico gibi bir ödeme altyapısı kullanılıyorsa:
+   - Backend `pricingPlanReferenceCode` (Iyzico plan reference) ile checkout formu başlatır.
+   - Iyzico sandbox / production, bir *checkout token* veya *checkout form HTML* döner.
+   - Token iframe içinde gösterilir; müşteri kart bilgilerini girer ve ilk ödeme işlenir.
+4. Iyzico success callback (webhook) gönderir — backend doğrular ve `status: active` veya `status: failed` olarak günceller.
+
+---
+
+### 2) Abonelik Döngüsü
+- Frekans: 30/60/90 gün gibi periyotlarla planlanır. Her periyot için Iyzico recurring charge otomatik olur.
+- Gönderim: Ödeme onayı alındıktan sonra lojistik sistemine (pick&pack) sipariş oluşturulur ve kargo takip bilgisi üretilir.
+- Faturalama: Her çekimde fatura oluşturulmalı veya muhasebe için detaylar kaydedilmelidir (mükellefiyete göre KDV vb.).
+
+---
+
+### 3) İptal & Değişiklikler
+- Müşteri panelinden iptal: iptal talebi alındığında bir sonraki scheduled charge iptal edilir; mevcut çekim dönemi için ürün gönderimi genelde gerçekleşir.
+- Erken iptal ve iade: işletme politikası ile uyumlu şekilde 14 gün içinde iade prosedürü uygulanabilir.
+- Plan değişikliği: değiştirilen plan için pro-rata (kısmi ödeme) veya yeni plan uygulanır — tercih size bağlı.
+
+---
+
+### 4) Ödeme Hataları, Dunning (Tahsilat Yaklaşımı)
+- Başarısız ödeme: ilk başarısızlıkta e-posta/SMS bilgilendirme, 2. başarısızlıkta 48 saat sonra tekrar deneme, 3. deneme sonrası abonelik askıya alınır.
+- Askıya alma: askıya alınan abonelikte müşteriye uyarı, 7 gün sonra ödeme alınamazsa iptal prosedürü uygulanır.
+- Ödeme retry politikası ve e-posta şablonları önceden hazırlanmalı.
+
+---
+
+### 5) Marka Komisyon & Reconciliation
+- Sipariş başına komisyon oranı (ör: %15) ile marka payı hesaplanır.
+- Her ay marka bazlı `payout` raporu oluşturulur: tamamlanan gönderimler -> toplam satış -> komisyon -> marka net ödemesi.
+- Marka ödemesi banka transferi ile manuel veya otomatik olarak yapılır; ödeme kaydı sistemde tutulur (payment proof, fatura tarihi).
+
+---
+
+### 6) Güvenlik & Webhook Doğrulama
+- Webhook endpoint'leri doğrulanmalı (signed payload veya secret token).
+- Callback'leri sadece Iyzico IP bloklarından veya HMAC signature ile kabul edin.
+- Özel anahtarlar (IYZICO_API_KEY, IYZICO_SECRET_KEY) kesinlikle sunucu ortam değişkenlerinde saklanmalı, kod deposuna konmamalı.
+
+---
+
+### 7) Operasyonel Notlar (Lojistik)
+- Abonelik ID'si -> picklist oluşturma -> paketleme -> kargo takip numarası -> abonelik kaydına eklenmeli.
+- Gönderim gecikmesi durumunda müşteri bilgilendirilmeli; otomatik çekim zamanı buna göre yönetilmeli.
+- Abonelik durumu (active, suspended, cancelled, pending payment, completed) dashboard'da görünmelidir.
+
+---
+
+### 8) Raporlama
+- Günlük/haftalık: yeni abonelikler, başarısız ödemeler, iptaller, net gelir.
+- Aylık: marka hakedişleri, pazarlama maliyetleri, churn rate (aylık iptal oranı).
+
+---
+
+### 9) Geliştirme & Production checklist
+1. Sandbox testler (Iyzico sandbox).
+2. Webhook doğrulama & logging.
+3. SSL + güvenli ortam.
+4. Yedekleme & DB migration stratejisi.
+5. Test senaryoları: iptal, kart güncelleme, başarısız ödemeler, pro-rata plan değişikliği.
+
+---
+
+Bu abonelik akışı NATUVISIO için kapsayıcı bir altyapı sağlar; ödeme sağlayıcınız (iyzico) özelliklerine göre küçük ayarlamalar gerekebilir (ör: plan referans kodları, checkout form türleri).
+""")
+st.markdown("</div>", unsafe_allow_html=True)
 
 # -----------------------
-# MAIN
+# SON: küçük admin / debug panel (sadece lokal kullanım)
 # -----------------------
-if "admin_logged_in" not in st.session_state:
-    st.session_state.admin_logged_in = False
-if "is_partner_logged_in" not in st.session_state:
-    st.session_state.is_partner_logged_in = False
-if "partner_brand" not in st.session_state:
-    st.session_state.partner_brand = None
-
-if __name__ == "__main__":
-    # Show optional warning if requests missing
-    if requests is None:
-        st.error("Uyarı: 'requests' kütüphanesi yüklü değil. Lütfen 'pip install requests' çalıştırın. API çağrıları çalışmaz.")
-    if not IYZICO_API_KEY or not IYZICO_SECRET_KEY:
-        st.warning("Iyzico API anahtarları boş. Ortam değişkenlerini ayarlayın (IYZICO_API_KEY, IYZICO_SECRET_KEY). Sandbox testi için gerekli.")
-    if not CALLBACK_BASE_URL:
-        st.info("CALLBACK_BASE_URL boş: webhook callback'leri alınmayacaktır. Geliştirme için ngrok kullanın ve bu değeri ayarlayın.")
-    if FLASK_AVAILABLE:
-        st.success("Flask bulundu: webhook endpoint'leri otomatik olarak başlatılacak.")
-    else:
-        st.info("Flask yüklü değil: webhook endpoint devre dışı kalacak. 'pip install flask' ile etkinleştirin.")
-
-    if st.session_state.admin_logged_in:
-        admin_dashboard()
-    elif st.session_state.is_partner_logged_in:
-        partner_dashboard()
-    else:
-        login_screen()
+st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+if st.checkbox("🔒 Debug: Son 20 kayıtları göster"):
+    cur = conn.cursor()
+    cur.execute("SELECT id, created_at, email, name, sku, frequency, status FROM subscriptions ORDER BY created_at DESC LIMIT 20")
+    rows = cur.fetchall()
+    st.table(rows)
