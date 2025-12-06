@@ -1,502 +1,269 @@
-<!--
-  BLACK STUFF SUBSCRIPTION HERO + 4-STEP FLOW
-  -------------------------------------------------
-  - Fully self-contained: just paste into your template
-  - Uses CSS variables for easy theming
-  - Inline SVG icons (hand, truck, calendar, relax)
-  - Designed to be reused for 2 SKUs:
-      BLACK STUFF WELLBEING  &  BLACK STUFF OXIFIT
--->
+# natuvisio_subscribe.py
+# Run: streamlit run natuvisio_subscribe.py
+# Requires: pip install streamlit flask requests
 
-<section class="bs-subscription-page" aria-labelledby="bs-subscription-heading">
+import os
+import json
+import requests
+import sqlite3
+import threading
+import time
+import uuid
+from datetime import datetime
 
-  <!-- ======================= HERO ======================= -->
-  <div class="bs-hero">
-    <div class="bs-hero__image-layer"></div>
-    <div class="bs-hero__overlay"></div>
+import streamlit as st
+from flask import Flask, request, jsonify
+import streamlit.components.v1 as components
 
-    <div class="bs-hero__content">
-      <p class="bs-hero__eyebrow">BLACK STUFF SUBSCRIPTION</p>
+# -----------------------
+# CONFIG / ORTAM DEGISKENLERI
+# -----------------------
+IYZICO_API_KEY = os.getenv("IYZICO_API_KEY", "")
+IYZICO_SECRET_KEY = os.getenv("IYZICO_SECRET_KEY", "")
+BASE_API = os.getenv("IYZICO_BASE_API", "https://sandbox-api.iyzipay.com")
+BASE_CHECKOUT = os.getenv("IYZICO_CHECKOUT_URL", "https://sandbox-checkout.iyzipay.com/checkoutform/initialize")
 
-      <h1 id="bs-subscription-heading" class="bs-hero__title">
-        SĒŅU ABONEMENTS<br>
-        MIKROBIOMA PAMATAM
-      </h1>
+WELLBEING_PLAN_REF = os.getenv("WELLBEING_PLAN_REF", "")
+OXIFIT_PLAN_REF = os.getenv("OXIFIT_PLAN_REF", "")
+CALLBACK_BASE_URL = os.getenv("CALLBACK_BASE_URL", "")  # example: https://abcd1234.ngrok.io
 
-      <p class="bs-hero__text">
-        Ļauj mums strādāt tavā vietā. Izvēlies
-        <strong>BLACK STUFF WELLBEING</strong> vai
-        <strong>BLACK STUFF OXIFIT</strong>, un mēs
-        piegādāsim tavu devu līdz durvīm ik pēc 30 dienām –
-        bez liekas domāšanas, bez iztrūkstošām dienām.
-      </p>
+DB_PATH = "subscriptions.db"
 
-      <p class="bs-hero__text bs-hero__text--highlight">
-        Abonē un ietaupi līdz <strong>17%</strong>, saglabājot
-        ritmu savam zarnu–smadzeņu savienojumam.
-      </p>
+# -----------------------
+# BASLANGIC: DB OLUŞTUR
+# -----------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        id TEXT PRIMARY KEY,
+        sku TEXT,
+        plan_reference TEXT,
+        iyzico_subscription_reference TEXT,
+        status TEXT,
+        customer_email TEXT,
+        customer_name TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        raw_payload TEXT
+    )
+    """)
+    conn.commit()
+    return conn
 
-      <div class="bs-hero__cta-row">
-        <button class="bs-hero__btn bs-hero__btn--primary">
-          Abonēt WELLBEING
-        </button>
-        <button class="bs-hero__btn bs-hero__btn--ghost">
-          Abonēt OXIFIT
-        </button>
-      </div>
+conn = init_db()
 
-      <p class="bs-hero__note">
-        Abonementu vari pārvaldīt un atcelt jebkurā brīdī. Nekādu slēpto rindu.
-      </p>
-    </div>
-  </div>
+# -----------------------
+# IYZICO CHECKOUT TOKEN CREATION
+# -----------------------
+def create_subscription_checkout_token(plan_reference, customer_email, customer_name, gsm_number, conversation_id=None):
+    """
+    Iyzico subscription checkout token oluşturur.
+    Dönen token ile iframe url oluşturulur.
+    """
+    if not IYZICO_API_KEY or not IYZICO_SECRET_KEY:
+        raise RuntimeError("IYZICO API anahtarları ortam değişkenlerinde yok. IYZICO_API_KEY ve IYZICO_SECRET_KEY ayarlayın.")
 
-  <!-- ======================= PROCESS STEPS ======================= -->
-  <div class="bs-flow" aria-label="Kā tas strādā?">
-    <h2 class="bs-flow__heading">Kā tas strādā?</h2>
-    <p class="bs-flow__subheading">
-      Četri skaidri soļi – tas pats ritms gan WELLBEING, gan OXIFIT abonementam.
-    </p>
+    url = f"{BASE_API}/v2/subscription/checkout-form/initialize"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    payload = {
+        "locale": "tr",
+        "conversationId": conversation_id or str(uuid.uuid4()),
+        "pricingPlanReferenceCode": plan_reference,
+        "callbackUrl": f"{CALLBACK_BASE_URL}/iyzico_callback",
+        "customer": {
+            "email": customer_email,
+            "name": customer_name.split(" ")[0] if customer_name else "",
+            "surname": " ".join(customer_name.split(" ")[1:]) if customer_name and len(customer_name.split(" "))>1 else "",
+            "gsmNumber": gsm_number
+        }
+    }
 
-    <div class="bs-flow__grid">
-      <!-- STEP 1: SIGN UP -->
-      <article class="bs-step">
-        <div class="bs-step__icon">
-          <!-- HAND WRITING SVG -->
-          <svg viewBox="0 0 64 64" aria-hidden="true">
-            <!-- paper -->
-            <rect x="8" y="10" width="24" height="40" rx="3"
-                  class="bs-icon__stroke" />
-            <line x1="14" y1="20" x2="28" y2="20" class="bs-icon__stroke" />
-            <line x1="14" y1="26" x2="26" y2="26" class="bs-icon__stroke" />
-            <line x1="14" y1="32" x2="24" y2="32" class="bs-icon__stroke" />
+    # istek
+    resp = requests.post(url, headers=headers, auth=(IYZICO_API_KEY, IYZICO_SECRET_KEY), data=json.dumps(payload), timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Iyzico API hata: {resp.status_code} {resp.text}")
+    data = resp.json()
+    token = data.get("token")
+    if not token:
+        raise RuntimeError(f"Iyzico token gelmedi: {data}")
+    checkout_url = f"{BASE_CHECKOUT}/{token}"
+    return checkout_url, data
 
-            <!-- hand & pen -->
-            <path d="M28 38 l6 10 c1.2 2 3.4 3 5.6 2.5l7.4-1.8c1.8-.5 3-2 3-3.8
-                     0-1-.4-1.9-1.1-2.6l-9.6-9.6c-.7-.7-1.6-1.1-2.6-1.1
-                     -1.4 0-2.8.8-3.5 2.2l-2.6 4.9z"
-                  class="bs-icon__stroke bs-icon__fill-soft" />
-            <path d="M50 19 l5 5 -7.5 13.5c-.3.6-1 .8-1.6.5l-3-1.7c-.6-.3-.8-1-.5-1.6L50 19z"
-                  class="bs-icon__stroke" />
-            <path d="M51 18l3-5" class="bs-icon__stroke" />
-          </svg>
-        </div>
-        <h3 class="bs-step__title">Piesakies abonementam</h3>
-        <p class="bs-step__text">
-          Izvēlies savu devu – <strong>WELLBEING</strong> vai <strong>OXIFIT</strong> –
-          norādi biežumu un apstiprini maksājumu. Pārējo sistēma izdara tavā vietā.
-        </p>
-      </article>
+# -----------------------
+# DB KAYIT/GUNCELLEME
+# -----------------------
+def save_subscription_record(sku, plan_reference, iyzico_ref, status, email, name, raw_payload):
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    id_ = str(uuid.uuid4())
+    cur.execute("""
+      INSERT INTO subscriptions (id, sku, plan_reference, iyzico_subscription_reference, status, customer_email, customer_name, created_at, updated_at, raw_payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (id_, sku, plan_reference, iyzico_ref, status, email, name, now, now, json.dumps(raw_payload)))
+    conn.commit()
+    return id_
 
-      <!-- STEP 2: RECEIVE PRODUCT -->
-      <article class="bs-step">
-        <div class="bs-step__icon">
-          <!-- TRUCK SVG -->
-          <svg viewBox="0 0 64 64" aria-hidden="true">
-            <!-- truck body -->
-            <rect x="8" y="24" width="28" height="16" rx="2"
-                  class="bs-icon__stroke bs-icon__fill-soft" />
-            <rect x="36" y="28" width="14" height="12" rx="2"
-                  class="bs-icon__stroke bs-icon__fill-soft" />
-            <!-- cabin window -->
-            <rect x="39" y="30" width="6" height="6" rx="1"
-                  class="bs-icon__stroke" />
+def update_subscription_record_by_iyzico_ref(iyzico_ref, status, raw_payload):
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    cur.execute("""
+      SELECT id FROM subscriptions WHERE iyzico_subscription_reference = ?
+    """, (iyzico_ref,))
+    row = cur.fetchone()
+    if row:
+        cur.execute("""
+          UPDATE subscriptions SET status = ?, updated_at = ?, raw_payload = ? WHERE iyzico_subscription_reference = ?
+        """, (status, now, json.dumps(raw_payload), iyzico_ref))
+        conn.commit()
+        return row[0]
+    else:
+        # yoksa yeni kayıt yap (opsiyonel)
+        cur.execute("""
+          INSERT INTO subscriptions (id, sku, plan_reference, iyzico_subscription_reference, status, created_at, updated_at, raw_payload)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (str(uuid.uuid4()), "", "", iyzico_ref, status, now, now, json.dumps(raw_payload)))
+        conn.commit()
+        return None
 
-            <!-- ground line -->
-            <line x1="6" y1="40" x2="58" y2="40" class="bs-icon__stroke" />
+# -----------------------
+# FLASK WEBHOOK (background thread)
+# -----------------------
+flask_app = Flask(__name__)
 
-            <!-- wheels -->
-            <circle cx="18" cy="44" r="4" class="bs-icon__stroke bs-icon__fill-strong" />
-            <circle cx="42" cy="44" r="4" class="bs-icon__stroke bs-icon__fill-strong" />
+@flask_app.route("/iyzico_callback", methods=["POST"])
+def iyzico_callback():
+    try:
+        payload = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({"error": "invalid json", "msg": str(e)}), 400
 
-            <!-- motion lines -->
-            <line x1="4" y1="28" x2="12" y2="28" class="bs-icon__stroke" />
-            <line x1="4" y1="32" x2="10" y2="32" class="bs-icon__stroke" />
-          </svg>
-        </div>
-        <h3 class="bs-step__title">Saņem produktu</h3>
-        <p class="bs-step__text">
-          Pirmā mikrobiomu atbalstošā deva nonāk pie tevis dažu dienu laikā – drošā
-          iepakojumā, gatava integrēties tavā ikdienas ritmā.
-        </p>
-      </article>
+    # Iyzico callback payload içeriğine göre parse edin.
+    # Dokümanda farklı isimler olabilir. Burada genel yaklaşımdır.
+    # Örnek field: payload["subscriptionReferenceCode"] veya payload["subscriptionReference"]
+    # Örnek status field: payload["status"]
+    # Bu alanlar sandbox testlerinde gelen gerçek payload ile eşleşecek şekilde uyarlanmalı.
+    iyzico_ref = payload.get("subscriptionReferenceCode") or payload.get("subscriptionReference") or payload.get("subscriptionReferenceId")
+    status = payload.get("status") or payload.get("paymentStatus") or "unknown"
 
-      <!-- STEP 3: AUTOMATIC DELIVERIES -->
-      <article class="bs-step">
-        <div class="bs-step__icon">
-          <!-- CALENDAR SVG -->
-          <svg viewBox="0 0 64 64" aria-hidden="true">
-            <!-- frame -->
-            <rect x="10" y="16" width="44" height="34" rx="4"
-                  class="bs-icon__stroke bs-icon__fill-soft" />
-            <line x1="10" y1="24" x2="54" y2="24" class="bs-icon__stroke" />
+    # DB'ye kaydet/guncelle
+    if iyzico_ref:
+        update_subscription_record_by_iyzico_ref(iyzico_ref, status, payload)
+    else:
+        # alert: payload şekli beklenmedikse kaydet
+        cur = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        cur.execute("""
+          INSERT INTO subscriptions (id, sku, plan_reference, iyzico_subscription_reference, status, created_at, updated_at, raw_payload)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (str(uuid.uuid4()), "", "", "", "callback_received", now, now, json.dumps(payload)))
+        conn.commit()
 
-            <!-- rings -->
-            <line x1="22" y1="12" x2="22" y2="18" class="bs-icon__stroke" />
-            <line x1="32" y1="12" x2="32" y2="18" class="bs-icon__stroke" />
-            <line x1="42" y1="12" x2="42" y2="18" class="bs-icon__stroke" />
+    # Iyzico için 200 dön
+    return jsonify({"ok": True}), 200
 
-            <!-- dots / days (simplified grid) -->
-            <circle cx="20" cy="30" r="1.5" class="bs-icon__stroke" />
-            <circle cx="30" cy="30" r="1.5" class="bs-icon__stroke" />
-            <circle cx="40" cy="30" r="1.5" class="bs-icon__stroke" />
-            <circle cx="20" cy="36" r="1.5" class="bs-icon__stroke" />
-            <circle cx="30" cy="36" r="1.5" class="bs-icon__stroke" />
-            <circle cx="40" cy="36" r="1.5" class="bs-icon__stroke" />
-            <circle cx="20" cy="42" r="1.5" class="bs-icon__stroke" />
-            <circle cx="30" cy="42" r="1.5" class="bs-icon__stroke" />
-            <circle cx="40" cy="42" r="1.5" class="bs-icon__stroke" />
+def run_flask():
+    # internal debug server, production için ayrı bir deploy öneririm
+    flask_app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
 
-            <!-- highlighted recurring day -->
-            <circle cx="40" cy="30" r="3.5" class="bs-icon__stroke" />
-          </svg>
-        </div>
-        <h3 class="bs-step__title">Automātiskas piegādes</h3>
-        <p class="bs-step__text">
-          Katras 30 dienas – bez atgādinājumiem kalendārā. Sistēma sinhronizē
-          piegādi ar tavu izvēlēto režīmu, lai maksimāli stabilizētu tavu pamatu.
-        </p>
-      </article>
+# Start flask in background thread if not already started
+def ensure_flask_started():
+    if not hasattr(ensure_flask_started, "started"):
+        t = threading.Thread(target=run_flask, daemon=True)
+        t.start()
+        ensure_flask_started.started = True
+        # Allow server to spin up
+        time.sleep(0.5)
 
-      <!-- STEP 4: CANCEL ANY TIME -->
-      <article class="bs-step">
-        <div class="bs-step__icon">
-          <!-- RELAX PERSON SVG -->
-          <svg viewBox="0 0 64 64" aria-hidden="true">
-            <!-- card / sofa -->
-            <rect x="10" y="18" width="44" height="28" rx="6"
-                  transform="rotate(-20 32 32)"
-                  class="bs-icon__stroke bs-icon__fill-soft" />
+# -----------------------
+# STREAMLIT UI
+# -----------------------
+st.set_page_config(page_title="NATUVISIO - Abonelik", layout="centered")
+st.markdown("<style>body { font-family: Inter, system-ui, -apple-system; }</style>", unsafe_allow_html=True)
 
-            <!-- person head -->
-            <circle cx="26" cy="24" r="3"
-                    class="bs-icon__stroke bs-icon__fill-strong" />
+st.title("NATUVISIO — Abonelik Sistemi (Iyzico Sandbox)")
 
-            <!-- body -->
-            <path d="M24 27 l8 5 6-4"
-                  class="bs-icon__stroke" />
-            <!-- legs -->
-            <path d="M32 32 l6 7"
-                  class="bs-icon__stroke" />
-            <path d="M30 33 l-2 8"
-                  class="bs-icon__stroke" />
-          </svg>
-        </div>
-        <h3 class="bs-step__title">Atcel jebkurā laikā</h3>
-        <p class="bs-step__text">
-          Nav piespiedu saistību – vari pauzēt, mainīt produktu starp
-          WELLBEING un OXIFIT vai atslēgt abonementu ar dažiem klikšķiem.
-        </p>
-      </article>
-    </div>
-  </div>
+# başlat flask webhook
+ensure_flask_started()
 
-</section>
+st.info("Not: Webhook URL'nizin Iyzico sandbox veya production panelinde /iyzico_callback olacak şekilde açık olduğundan emin olun. Lokal geliştirme için ngrok kullanabilirsiniz.")
 
-<style>
-/* =========================================================
-   BLACK STUFF SUBSCRIPTION LAYOUT
-   Designed to be theme-agnostic & Shopify-ready
-   ======================================================= */
+# seçilecek SKU ve plan referansları
+sku_choice = st.radio("Hangi ürün için abonelik başlatmak istiyorsunuz?", ("BLACK STUFF WELLBEING", "BLACK STUFF OXIFIT"))
 
-/* ---------- Root tokens ---------- */
-.bs-subscription-page {
-  --bs-color-bg-dark: #050608;
-  --bs-color-bg-soft: #111217;
-  --bs-color-text-main: #f5f5f2;
-  --bs-color-text-soft: rgba(245, 245, 242, 0.78);
-  --bs-color-accent: #5b7354;   /* NATUVISIO green */
-  --bs-color-accent-soft: rgba(91, 115, 84, 0.28);
-  --bs-color-border-soft: rgba(255, 255, 255, 0.12);
-  --bs-radius-lg: 24px;
-  --bs-radius-md: 16px;
-  --bs-radius-pill: 999px;
-  --bs-shadow-soft: 0 18px 55px rgba(0, 0, 0, 0.55);
-  --bs-font-body: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
-                  "Inter", sans-serif;
+plan_map = {
+    "BLACK STUFF WELLBEING": WELLBEING_PLAN_REF,
+    "BLACK STUFF OXIFIT": OXIFIT_PLAN_REF
 }
 
-/* base */
-.bs-subscription-page {
-  font-family: var(--bs-font-body);
-  color: var(--bs-color-text-main);
-  background-color: var(--bs-color-bg-dark);
-}
+plan_ref = plan_map.get(sku_choice)
+if not plan_ref:
+    st.warning("Bu SKU için plan referansı ortam değişkenlerinde tanımlı değil. WELLBEING_PLAN_REF veya OXIFIT_PLAN_REF ayarlayın.")
 
-/* remove default margins in most contexts */
-.bs-subscription-page * {
-  box-sizing: border-box;
-}
+st.markdown("---")
+st.subheader("Müşteri Bilgileri")
+col1, col2 = st.columns(2)
+with col1:
+    cust_name = st.text_input("Ad Soyad", value="Musteri Örnek")
+with col2:
+    cust_email = st.text_input("E-posta", value="muster@ornek.com")
+cust_phone = st.text_input("Telefon (örn. +90555...)", value="+905555555555")
 
-/* =========================================================
-   HERO SECTION
-   ======================================================= */
+st.selectbox("Abonelik Frekansı (Iyzico planınızı bu frekanslarla oluşturun)", ["Aylık (30 gün)", "Her 60 gün", "Custom - yönetim"], index=0, disabled=True)
 
-.bs-hero {
-  position: relative;
-  overflow: hidden;
-  min-height: min(75vh, 640px);
-  display: flex;
-  align-items: center;
-  padding: 64px clamp(24px, 8vw, 80px);
-  background: radial-gradient(circle at top left,
-    rgba(255, 255, 255, 0.06),
-    transparent 55%);
-}
+discount_choice = st.selectbox("İndirim Uygulamak istiyor musunuz?", ["Yok", "İlk Ödeme İndirimi", "Her Ödeme İndirimi - plan ile ayrı oluşturun"], index=0)
+if discount_choice != "Yok":
+    st.info("İndirimler genelde Iyzico tarafında ayrı bir pricing plan oluşturarak uygulanır. Burada ilk ödeme indirimi için ayrı plan referansı kullanın.")
 
-/* background image from your visual system */
-.bs-hero__image-layer {
-  position: absolute;
-  inset: 0;
-  background-image: url("https://res.cloudinary.com/deb1j92hy/image/upload/v1764848571/man-standing-brown-mountain-range_elqddb.webp");
-  background-size: cover;
-  background-position: center;
-  opacity: 0.4;
-  transform: scale(1.03);
-}
+st.markdown("---")
 
-/* gradient overlay to keep text readable */
-.bs-hero__overlay {
-  position: absolute;
-  inset: 0;
-  background:
-    linear-gradient(90deg, rgba(5, 6, 8, 0.95) 0%, rgba(5, 6, 8, 0.7) 36%,
-                          rgba(5, 6, 8, 0.2) 72%, rgba(5, 6, 8, 0.85) 100%),
-    linear-gradient(180deg, rgba(5, 6, 8, 0.4) 0%, rgba(5, 6, 8, 0.9) 100%);
-}
+# Abone ol butonu → checkout token oluştur ve iframe göster
+if st.button("Abone Ol - Ödeme Sayfasını Aç"):
+    if not plan_ref:
+        st.error("Plan referansı eksik. Ortam değişkenlerini kontrol edin.")
+    elif not CALLBACK_BASE_URL:
+        st.error("CALLBACK_BASE_URL ortam değişkeni ayarlanmamış. Webhook için gerekli.")
+    else:
+        try:
+            checkout_url, raw = create_subscription_checkout_token(plan_ref, cust_email, cust_name, cust_phone)
+            st.success("Ödeme oturumu oluşturuldu. Aşağıdaki ödeme penceresinden kart bilgilerini girin.")
+            # DB'ye ön kayıt (iyzico_ref henüz gelmediği için boş bırakıyoruz, webhook ile güncellenecek)
+            save_subscription_record(sku_choice, plan_ref, raw.get("subscriptionReference") or raw.get("subscriptionReferenceCode") or "", "pending", cust_email, cust_name, raw)
+            # iframe embed (Streamlit components)
+            iframe_html = f"""<iframe src="{checkout_url}" width="100%" height="760" frameborder="0" scrolling="no"></iframe>"""
+            components.html(iframe_html, height=760)
+        except Exception as e:
+            st.exception(e)
 
-/* content */
-.bs-hero__content {
-  position: relative;
-  z-index: 1;
-  max-width: 620px;
-  margin-left: auto;
-}
+st.markdown("---")
+st.subheader("Yönetim: Kayıtlı Abonelikler (yerel DB)")
+try:
+    cur = conn.cursor()
+    cur.execute("SELECT id, sku, plan_reference, iyzico_subscription_reference, status, customer_email, created_at FROM subscriptions ORDER BY created_at DESC LIMIT 200")
+    rows = cur.fetchall()
+    if rows:
+        for r in rows:
+            st.write({
+                "id": r[0],
+                "sku": r[1],
+                "plan_reference": r[2],
+                "iyzico_subscription_reference": r[3],
+                "status": r[4],
+                "customer_email": r[5],
+                "created_at": r[6]
+            })
+    else:
+        st.write("Henüz abonelik kaydı yok.")
+except Exception as e:
+    st.error("DB okuma hatası: " + str(e))
 
-.bs-hero__eyebrow {
-  font-size: 0.85rem;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: rgba(245, 245, 242, 0.78);
-  margin-bottom: 12px;
-}
-
-.bs-hero__title {
-  font-size: clamp(2.2rem, 3vw, 3rem);
-  line-height: 1.15;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  margin: 0 0 20px;
-}
-
-.bs-hero__text {
-  font-size: 1rem;
-  line-height: 1.7;
-  color: var(--bs-color-text-soft);
-  margin: 0 0 14px;
-}
-
-.bs-hero__text strong {
-  color: #ffffff;
-  font-weight: 600;
-}
-
-.bs-hero__text--highlight {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.18);
-}
-
-.bs-hero__cta-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 26px;
-}
-
-.bs-hero__btn {
-  border-radius: var(--bs-radius-pill);
-  border: 1px solid transparent;
-  cursor: pointer;
-  font-size: 0.95rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  padding: 11px 28px;
-  transition: all 180ms ease-out;
-}
-
-.bs-hero__btn--primary {
-  background: var(--bs-color-accent);
-  color: #fdfdfb;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
-}
-
-.bs-hero__btn--primary:hover {
-  background: #6a8562;
-  transform: translateY(-1px);
-}
-
-.bs-hero__btn--ghost {
-  background: transparent;
-  color: var(--bs-color-text-main);
-  border-color: rgba(255, 255, 255, 0.35);
-}
-
-.bs-hero__btn--ghost:hover {
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.bs-hero__note {
-  margin-top: 14px;
-  font-size: 0.82rem;
-  color: rgba(245, 245, 242, 0.68);
-}
-
-/* =========================================================
-   FLOW SECTION – 4 STEP CARDS
-   ======================================================= */
-
-.bs-flow {
-  padding: 40px clamp(20px, 8vw, 80px) 80px;
-  background: radial-gradient(circle at top,
-              rgba(91, 115, 84, 0.16), transparent 55%),
-              var(--bs-color-bg-soft);
-}
-
-.bs-flow__heading {
-  font-size: 1.75rem;
-  margin: 0 0 6px;
-}
-
-.bs-flow__subheading {
-  margin: 0 0 30px;
-  color: rgba(245, 245, 242, 0.78);
-  max-width: 620px;
-}
-
-/* grid */
-.bs-flow__grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 18px;
-}
-
-/* step card */
-.bs-step {
-  background: radial-gradient(circle at top left,
-              rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.01));
-  border-radius: var(--bs-radius-md);
-  border: 1px solid var(--bs-color-border-soft);
-  padding: 20px 18px 18px;
-  box-shadow: 0 15px 40px rgba(0, 0, 0, 0.5);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  position: relative;
-  overflow: hidden;
-}
-
-/* subtle corner glow */
-.bs-step::before {
-  content: "";
-  position: absolute;
-  inset: -40%;
-  background: radial-gradient(circle at top right,
-              rgba(91, 115, 84, 0.24), transparent 55%);
-  opacity: 0;
-  transition: opacity 200ms ease-out;
-}
-
-.bs-step:hover::before {
-  opacity: 1;
-}
-
-.bs-step__icon {
-  width: 64px;
-  height: 64px;
-  border-radius: 18px;
-  background: rgba(5, 6, 8, 0.8);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 4px;
-  position: relative;
-  z-index: 1;
-}
-
-.bs-step__icon svg {
-  width: 40px;
-  height: 40px;
-}
-
-/* icon stroke + fills */
-.bs-icon__stroke {
-  fill: none;
-  stroke: #f5f5f2;
-  stroke-width: 2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.bs-icon__fill-soft {
-  fill: rgba(245, 245, 242, 0.06);
-}
-
-.bs-icon__fill-strong {
-  fill: rgba(245, 245, 242, 0.9);
-}
-
-.bs-step__title {
-  font-size: 0.88rem;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  margin: 0;
-}
-
-.bs-step__text {
-  font-size: 0.9rem;
-  line-height: 1.6;
-  color: rgba(245, 245, 242, 0.85);
-  margin: 0;
-}
-
-/* =========================================================
-   RESPONSIVE
-   ======================================================= */
-
-@media (max-width: 980px) {
-  .bs-hero {
-    padding-inline: 24px;
-    align-items: flex-end;
-  }
-  .bs-hero__content {
-    max-width: 100%;
-  }
-}
-
-@media (max-width: 840px) {
-  .bs-flow__grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .bs-step {
-    min-height: 210px;
-  }
-}
-
-@media (max-width: 640px) {
-  .bs-hero {
-    padding-block: 48px;
-    min-height: auto;
-  }
-  .bs-flow {
-    padding-inline: 18px;
-  }
-  .bs-flow__grid {
-    grid-template-columns: 1fr;
-  }
-  .bs-step {
-    min-height: auto;
-  }
-}
-</style>
+st.markdown("#### Notlar")
+st.markdown("""
+- Iyzico'da indirimli ilk ödeme için ayrı bir 'pricing plan' oluşturmanız en doğru yöntemdir. 
+- Production geçmeden önce tüm callback ve plan referanslarını doğrulayın.
+- Lokal geliştirme için ngrok kullanın: `ngrok http 8080` ve CALLBACK_BASE_URL olarak ngrok URL'sini girin.
+""")
